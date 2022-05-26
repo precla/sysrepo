@@ -35,6 +35,8 @@ sr_subscription_ctx_t *subscription;
 volatile pthread_t oven_tid;
 /* oven state value determining whether the food is inside the oven or not */
 volatile int food_inside;
+/* oven state value determining wheter the door is locked or not - locked means pyrolysis is active */
+volatile int door_locked;
 /* oven state value determining whether the food is waiting for the oven to be ready */
 volatile int insert_food_on_ready;
 /* oven state value determining the current temperature of the oven */
@@ -47,12 +49,36 @@ oven_thread(void *arg)
 {
     int rc;
     unsigned int desired_temperature;
+    unsigned int pyrolysis_done = 0;
 
     (void)arg;
 
     while (oven_tid) {
         sleep(1);
-        if (oven_temperature < config_temperature) {
+        if (door_locked) {
+            /* door locked means pyrolysis is active, oven heats up to 400C and cools down */
+            if (oven_temperature < 400 && pyrolysis_done == 0) {
+                oven_temperature += 50;
+                if (oven_temperature >= 400) {
+                    /* pyrolysis temp reached */
+                    pyrolysis_done = 1;
+                    SRPLG_LOG_DBG("oven", "Pyrolysis reached max temp. Cooling down...");
+                }
+            } else {
+                /* cool down and after cool down unlock door */
+                oven_temperature -= 20;
+                if (oven_temperature < 25) {
+                    oven_temperature = 25;
+                    door_locked = 0;
+                    /* pyrolysis done, create notification */
+                    SRPLG_LOG_DBG("oven", "Pyrolysis done. Oven ready for usage.");
+                    rc = sr_notif_send(sess, "/oven:pyrolysis-done", NULL, 0, 0, 0);
+                    if (rc != SR_ERR_OK) {
+                        SRPLG_LOG_ERR("oven", "Pyrolysis-done notification generation failed: &s.", sr_strerror(rc));
+                    }
+                }
+            }
+        } else if (oven_temperature < config_temperature) {
             /* oven is heating up 50 degrees per second until the set temperature */
             if (oven_temperature + 50 < config_temperature) {
                 oven_temperature += 50;
@@ -165,6 +191,7 @@ oven_state_cb(sr_session_ctx_t *session, uint32_t sub_id, const char *module_nam
     sprintf(str, "%u", oven_temperature);
     lyd_new_path(NULL, ly_ctx, "/oven:oven-state/temperature", str, 0, parent);
     lyd_new_path(*parent, NULL, "/oven:oven-state/food-inside", food_inside ? "true" : "false", 0, NULL);
+    lyd_new_path(*parent, NULL, "/oven:oven-state/door-locked", door_locked ? "true" : "false", 0, NULL);
     sr_release_context(sr_session_get_connection(sess));
 
     return SR_ERR_OK;
@@ -185,6 +212,11 @@ oven_insert_food_cb(sr_session_ctx_t *session, uint32_t sub_id, const char *path
     (void)output;
     (void)output_cnt;
     (void)private_data;
+
+    if (door_locked) {
+        SRPLG_LOG_ERR("oven", "Pyrolysis active, wait for it to finish.");
+        return SR_ERR_OPERATION_FAILED;
+    }
 
     if (food_inside) {
         SRPLG_LOG_ERR("oven", "Food already in the oven.");
@@ -222,6 +254,11 @@ oven_remove_food_cb(sr_session_ctx_t *session, uint32_t sub_id, const char *path
     (void)output_cnt;
     (void)private_data;
 
+    if (door_locked) {
+        SRPLG_LOG_ERR("oven", "Pyrolysis active, hence no food in ovens.");
+        return SR_ERR_OPERATION_FAILED;
+    }
+
     if (!food_inside) {
         SRPLG_LOG_ERR("oven", "Food not in the oven.");
         return SR_ERR_OPERATION_FAILED;
@@ -230,6 +267,52 @@ oven_remove_food_cb(sr_session_ctx_t *session, uint32_t sub_id, const char *path
     food_inside = 0;
     SRPLG_LOG_DBG("oven", "Food taken out of the oven.");
     return SR_ERR_OK;
+}
+
+static int
+oven_start_pyrolysis_cb(sr_session_ctx_t *session, uint32_t sub_id, const char *path, const sr_val_t *input,
+        const size_t input_cnt, sr_event_t event, uint32_t request_id, sr_val_t **output, size_t *output_cnt,
+        void *private_data)
+{
+    (void)session;
+    (void)sub_id;
+    (void)path;
+    (void)input;
+    (void)input_cnt;
+    (void)event;
+    (void)request_id;
+    (void)output;
+    (void)output_cnt;
+    (void)private_data;
+
+    int rc;
+
+    if (door_locked) {
+        SRPLG_LOG_ERR("oven", "Pyrolysis already active, wait for it to finish.");
+        return SR_ERR_OPERATION_FAILED;
+    }
+
+    if (food_inside) {
+        SRPLG_LOG_DBG("oven", "Remove food to avoid excessive smoke.");
+        return SR_ERR_OPERATION_FAILED;
+    }
+
+    door_locked = 1;
+
+    if (oven_tid == 0) {
+        /* the oven should be turned on and is not (create the oven thread) */
+        rc = pthread_create((pthread_t *)&oven_tid, NULL, oven_thread, NULL);
+        if (rc != 0) {
+            goto sys_error;
+        }
+    }
+
+    SRPLG_LOG_DBG("oven", "Starting pyrolysis.");
+    return SR_ERR_OK;
+
+sys_error:
+    SRPLG_LOG_ERR("oven", "Oven pyrolysis start callback failed: %s.", strerror(rc));
+    return SR_ERR_OPERATION_FAILED;
 }
 
 int
@@ -245,6 +328,7 @@ sr_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
     /* initialize the oven state */
     food_inside = 0;
     insert_food_on_ready = 0;
+    door_locked = 0;
     /* room temperature */
     oven_temperature = 25;
 
@@ -269,6 +353,11 @@ sr_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
 
     /* subscribe for remove-food RPC calls */
     rc = sr_rpc_subscribe(session, "/oven:remove-food", oven_remove_food_cb, NULL, 0, 0, &subscription);
+    if (rc != SR_ERR_OK) {
+        goto error;
+    }
+
+    rc = sr_rpc_subscribe(session, "/oven:start-pyrolysis", oven_start_pyrolysis_cb, NULL, 0, 0, &subscription);
     if (rc != SR_ERR_OK) {
         goto error;
     }

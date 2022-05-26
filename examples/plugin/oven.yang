@@ -42,6 +42,11 @@ module oven {
             description "Informs whether the food is inside the oven or not.";
             type boolean;
         }
+
+        leaf door-locked {
+            description "If door locked, pyrolysis is active.";
+            type boolean;
+        }
     }
 
     rpc insert-food {
@@ -69,11 +74,22 @@ module oven {
         description "Operation to order the oven to take the food out.";
     }
 
+    rpc start-pyrolysis {
+        description "Start pyrolysis for self-cleaning. No food allowed inside the oven.
+                     Oven door is locked until pyrolysis is finished.";
+    }
+
     notification oven-ready {
         description
             "Event of the configured temperature matching the actual
              temperature inside the oven. If the configured temperature
              is lower than the actual one, no notification is generated
              when the oven cools down to the configured temperature.";
+    }
+
+    notification pyrolysis-done {
+        description
+            "Event of finished pyrolysis. Door gets unlocked and oven
+             is ready and clean :)";
     }
 }
